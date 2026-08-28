@@ -1,0 +1,11 @@
+requests
+
+# opencv-python is intentionally NOT listed here: on Jetson/L4T, use the
+# JetPack-provided system OpenCV (apt, already on the image), which is built
+# with GStreamer support. The generic `pip install opencv-python` wheel is
+# built WITHOUT GStreamer support and will break the hardware H.264 encoder
+# pipeline (cv2.CAP_GSTREAMER) used in edge_client.py.
+#
+# Run this script as:
+#   PYTHONPATH=/usr/lib/python3/dist-packages python3 edge_client.py
+# so cv2 resolves to the system build instead of any pip-installed one.
