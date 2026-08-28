@@ -10,8 +10,15 @@ import requests
 # cam_id 0 (ZED 2i) is excluded: at its native 4416x1242 resolution the
 # Jetson's nvv4l2h264enc fails to create the hardware encoder (and hangs
 # rather than failing fast) - needs separate investigation before it can be
-# added back. The two Logitech C615 webcams (2, 4) work as expected.
-CAMERA_IDS = [2, 4]
+# added back. The two Logitech C615 webcams work as expected.
+#
+# NOTE: these are /dev/videoN indices, which V4L2/udev can renumber when USB
+# cameras are unplugged/replugged or the board reboots. If capture fails with
+# "can't open camera by index", re-check with `v4l2-ctl --list-devices` and
+# `v4l2-ctl --device=/dev/videoN --list-formats-ext` (the correct index is
+# the one that actually lists a capture format, not its paired metadata node)
+# and update this list.
+CAMERA_IDS = [3, 6]
 SERVER_URL = "http://192.168.1.50:5001"
 FRAME_WIDTH = 640
 FRAME_HEIGHT = 480
