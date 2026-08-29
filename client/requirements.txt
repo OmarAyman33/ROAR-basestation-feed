@@ -1,4 +1,8 @@
-requests
+websocket-client
+
+# websocket-client's import name (`websocket`) hasn't been checked for a
+# PYTHONPATH-shadowing conflict against this Jetson's system dist-packages
+# (see the PYTHONPATH note below) - verify on hardware if imports misbehave.
 
 # opencv-python is intentionally NOT listed here: on Jetson/L4T, use the
 # JetPack-provided system OpenCV (apt, already on the image), which is built

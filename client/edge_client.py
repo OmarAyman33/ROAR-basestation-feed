@@ -1,10 +1,11 @@
+import json
 import os
 import tempfile
 import threading
 import time
 
 import cv2
-import requests
+import websocket
 
 # --- Configuration ---
 # cam_id 0 (ZED 2i) is excluded: at its native 4416x1242 resolution the
@@ -19,7 +20,10 @@ import requests
 # the one that actually lists a capture format, not its paired metadata node)
 # and update this list.
 CAMERA_IDS = [3, 6]
-SERVER_URL = "http://192.168.1.50:5001"
+# Client and server run on different machines on the same LAN, so this can't
+# be a fixed default - it must match wherever server.py is actually running
+# right now (server.py prints its LAN address on startup).
+SERVER_URL = os.environ.get("SERVER_URL")
 FRAME_WIDTH = 640
 FRAME_HEIGHT = 480
 # Cameras that don't support the forced FRAME_WIDTH/FRAME_HEIGHT (e.g. the
@@ -72,7 +76,8 @@ def capture_loop(cam_id):
         camera.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
         camera.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
 
-    ingest_url = f"{SERVER_URL}/ingest/{cam_id}"
+    ws_url = SERVER_URL.replace("http://", "ws://", 1) + f"/ingest/{cam_id}"
+    ws = None
 
     while True:
         batch = []
@@ -83,6 +88,8 @@ def capture_loop(cam_id):
             success, frame = camera.read()
             if not success:
                 print(f"[cam {cam_id}] read failed, stopping capture thread")
+                if ws is not None:
+                    ws.close()
                 return
 
             now = time.time()
@@ -104,17 +111,28 @@ def capture_loop(cam_id):
             continue
 
         try:
-            requests.post(
-                ingest_url,
-                data=payload,
-                headers={
-                    "Content-Type": "video/mp4",
-                    "X-Batch-Start-Time": str(batch_start_time),
-                },
-                timeout=5,
-            )
-        except requests.RequestException as e:
-            print(f"[cam {cam_id}] post failed: {e}")
+            if ws is None:
+                ws = websocket.create_connection(ws_url, timeout=5)
+            ws.send(json.dumps({"batch_start_time": batch_start_time}))
+            ws.send(payload, opcode=websocket.ABNF.OPCODE_BINARY)
+        except (websocket.WebSocketException, OSError) as e:
+            print(f"[cam {cam_id}] ws send failed: {e}")
+            try:
+                ws.close()
+            except Exception:
+                pass
+            ws = None
+
+
+def check_server_url():
+    if not SERVER_URL:
+        raise RuntimeError(
+            "SERVER_URL is not set. Set it to the base station's address, "
+            "e.g.:\n\n"
+            "    SERVER_URL=http://192.168.1.23:5001 python3 edge_client.py\n\n"
+            "(find the right IP from server.py's startup log, which prints "
+            "the address(es) it's reachable at)."
+        )
 
 
 def check_gstreamer_support():
@@ -132,7 +150,9 @@ def check_gstreamer_support():
 
 
 def main():
+    check_server_url()
     check_gstreamer_support()
+    print(f"Starting edge client, pushing {CAMERA_IDS} to {SERVER_URL}")
     threads = [
         threading.Thread(target=capture_loop, args=(cam_id,), daemon=True)
         for cam_id in CAMERA_IDS
@@ -144,5 +164,4 @@ def main():
 
 
 if __name__ == "__main__":
-    print(f"Starting edge client, pushing {CAMERA_IDS} to {SERVER_URL}")
     main()

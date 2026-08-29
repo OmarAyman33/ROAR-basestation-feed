@@ -1,13 +1,17 @@
+import json
 import os
+import socket
 import tempfile
 import threading
 import time
 from collections import deque
 
 import cv2
-from flask import Flask, Response, jsonify, request
+from flask import Flask, jsonify
+from flask_sock import Sock
 
 app = Flask(__name__)
+sock = Sock(app)
 
 BATCH_DURATION_SEC = 0.5
 
@@ -17,11 +21,7 @@ last_frames = {}  # cam_id -> bytes (JPEG), held between batches
 stats = {}  # cam_id -> {"fps": float, "latency_ms": float}
 
 
-@app.route("/ingest/<int:cam_id>", methods=["POST"])
-def ingest(cam_id):
-    data = request.get_data()
-    batch_start = request.headers.get("X-Batch-Start-Time")
-
+def process_batch(cam_id, data, batch_start):
     tmp_path = tempfile.mktemp(suffix=".mp4")
     with open(tmp_path, "wb") as f:
         f.write(data)
@@ -41,7 +41,7 @@ def ingest(cam_id):
         os.remove(tmp_path)
 
     if not decoded_frames:
-        return "", 204
+        return
 
     fps = len(decoded_frames) / BATCH_DURATION_SEC
     latency_ms = (time.time() - float(batch_start)) * 1000 if batch_start else None
@@ -54,42 +54,41 @@ def ingest(cam_id):
             "latency_ms": round(latency_ms, 1) if latency_ms is not None else None,
         }
 
-    return "", 204
 
-
-def generate_frames(cam_id):
+@sock.route("/ingest/<int:cam_id>")
+def ingest_ws(ws, cam_id):
     while True:
-        with lock:
-            queue = frame_queues.get(cam_id)
-            fps = (stats.get(cam_id) or {}).get("fps") or 10
-            if queue:
-                frame_bytes = queue.popleft()
-                last_frames[cam_id] = frame_bytes
-            else:
-                frame_bytes = last_frames.get(cam_id)
+        meta_raw = ws.receive()
+        if meta_raw is None:
+            break
+        data = ws.receive()
+        if data is None:
+            break
+        batch_start = json.loads(meta_raw).get("batch_start_time")
+        process_batch(cam_id, data, batch_start)
 
+
+def next_frame(cam_id):
+    with lock:
+        queue = frame_queues.get(cam_id)
+        fps = (stats.get(cam_id) or {}).get("fps") or 10
+        if queue:
+            frame_bytes = queue.popleft()
+            last_frames[cam_id] = frame_bytes
+        else:
+            frame_bytes = last_frames.get(cam_id)
+    return frame_bytes, fps
+
+
+@sock.route("/feed/<int:cam_id>")
+def feed_ws(ws, cam_id):
+    while True:
+        frame_bytes, fps = next_frame(cam_id)
         if frame_bytes is None:
             time.sleep(0.1)
             continue
-
-        yield (
-            b"--frame\r\n"
-            b"Content-Type: image/jpeg\r\n\r\n" + frame_bytes + b"\r\n"
-        )
-
+        ws.send(frame_bytes)
         time.sleep(1 / fps)
-
-
-@app.route("/feed/<int:cam_id>")
-def feed(cam_id):
-    with lock:
-        known = cam_id in last_frames
-    if not known:
-        return "No frames received yet for this camera", 404
-    return Response(
-        generate_frames(cam_id),
-        mimetype="multipart/x-mixed-replace; boundary=frame",
-    )
 
 
 @app.route("/stats")
@@ -331,6 +330,20 @@ DASHBOARD_HTML = """
     const camCountEl = document.getElementById('cam-count-n');
     const tiles = {};
 
+    function connectFeed(camId, imgEl) {
+      const scheme = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const ws = new WebSocket(scheme + '//' + location.host + '/feed/' + camId);
+      ws.binaryType = 'blob';
+      let lastUrl = null;
+      ws.onmessage = (ev) => {
+        const url = URL.createObjectURL(ev.data);
+        imgEl.src = url;
+        if (lastUrl) URL.revokeObjectURL(lastUrl);
+        lastUrl = url;
+      };
+      ws.onclose = () => setTimeout(() => connectFeed(camId, imgEl), 1000);
+    }
+
     function ensureTile(camId) {
       if (tiles[camId]) return tiles[camId];
       const tile = document.createElement('div');
@@ -338,7 +351,7 @@ DASHBOARD_HTML = """
       tile.innerHTML =
         '<div class="tile-header"><span><span class="dot"></span>Camera ' + camId + '</span></div>' +
         '<div class="video-wrap">' +
-          '<img src="/feed/' + camId + '">' +
+          '<img id="img-' + camId + '">' +
           '<div class="stat-chip">' +
             '<div class="stat"><span class="label">FPS</span><span class="value" id="fps-' + camId + '">--</span></div>' +
             '<div class="stat"><span class="label">Latency</span><span class="value" id="latency-' + camId + '">--</span></div>' +
@@ -346,6 +359,7 @@ DASHBOARD_HTML = """
         '</div>';
       grid.appendChild(tile);
       tiles[camId] = tile;
+      connectFeed(camId, tile.querySelector('img'));
       return tile;
     }
 
@@ -398,6 +412,23 @@ def dashboard():
     return DASHBOARD_HTML
 
 
+def lan_ip():
+    # Doesn't actually send anything - UDP connect() just asks the OS to pick
+    # the local interface/IP it would use to reach that address, which is
+    # this machine's real LAN IP rather than the loopback address.
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    except OSError:
+        return None
+    finally:
+        s.close()
+
+
 if __name__ == "__main__":
-    print("Starting camera server on port 5001...")
+    ip = lan_ip() or "<this machine's LAN IP>"
+    print("Starting camera server...")
+    print(f"Dashboard: http://{ip}:5001/")
+    print(f"Point edge_client.py at this server with: SERVER_URL=http://{ip}:5001")
     app.run(host="0.0.0.0", port=5001, debug=False, threaded=True)
