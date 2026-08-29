@@ -1,6 +1,6 @@
-import json
 import os
 import socket
+import struct
 import tempfile
 import threading
 import time
@@ -14,6 +14,24 @@ app = Flask(__name__)
 sock = Sock(app)
 
 BATCH_DURATION_SEC = 0.5
+
+# UDP ingest wire format: each batch is chunked (a batch's encoded MP4 is
+# usually bigger than one safe UDP payload) into fixed-header packets:
+#   cam_id (I), batch_start_time (d), chunk_index (H), total_chunks (H)
+# followed by up to UDP_CHUNK_PAYLOAD_SIZE bytes of the batch's raw bytes.
+# 1400 total bytes keeps each packet under the ~1472-byte Ethernet MTU
+# fragmentation threshold, matched exactly on the client side.
+UDP_INGEST_PORT = 5002
+UDP_MAX_PACKET = 1400
+INGEST_HEADER_FORMAT = "!IdHH"
+INGEST_HEADER_SIZE = struct.calcsize(INGEST_HEADER_FORMAT)
+UDP_CHUNK_PAYLOAD_SIZE = UDP_MAX_PACKET - INGEST_HEADER_SIZE
+# How long an incomplete batch (missing chunks - lost packets, since UDP
+# doesn't guarantee delivery) is kept around before being dropped, so a lost
+# final chunk can't leak memory forever. Generous vs. BATCH_DURATION_SEC
+# since a healthy batch reassembles within a few milliseconds of the first
+# chunk arriving.
+STALE_BATCH_TIMEOUT_SEC = 2.0
 
 lock = threading.Lock()
 frame_queues = {}  # cam_id -> deque[bytes] (JPEG), frames awaiting playback
@@ -55,17 +73,49 @@ def process_batch(cam_id, data, batch_start):
         }
 
 
-@sock.route("/ingest/<int:cam_id>")
-def ingest_ws(ws, cam_id):
+def udp_ingest_loop():
+    udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    # Best-effort: a burst of chunks for one batch can arrive faster than this
+    # loop drains the kernel's receive queue, and the OS silently drops
+    # whatever doesn't fit (no exception, the batch just never completes).
+    # The OS may cap this below what's requested (e.g. Linux's
+    # net.core.rmem_max) regardless of the value here - that system-wide
+    # limit needs a sysctl change to actually raise, which is out of scope
+    # for this script. This only helps on machines where the ceiling is
+    # already higher than the default.
+    udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
+    udp_sock.bind(("0.0.0.0", UDP_INGEST_PORT))
+
+    # (cam_id, batch_start_time) -> {"chunks": {index: bytes}, "total": int, "first_seen": float}
+    # Single-threaded receive loop, so this dict needs no lock of its own -
+    # only process_batch()'s own locked state is shared with other threads.
+    pending_batches = {}
+
     while True:
-        meta_raw = ws.receive()
-        if meta_raw is None:
-            break
-        data = ws.receive()
-        if data is None:
-            break
-        batch_start = json.loads(meta_raw).get("batch_start_time")
-        process_batch(cam_id, data, batch_start)
+        packet, _addr = udp_sock.recvfrom(65536)
+        cam_id, batch_start_time, chunk_index, total_chunks = struct.unpack_from(
+            INGEST_HEADER_FORMAT, packet
+        )
+        chunk_data = packet[INGEST_HEADER_SIZE:]
+
+        key = (cam_id, batch_start_time)
+        entry = pending_batches.setdefault(
+            key, {"chunks": {}, "total": total_chunks, "first_seen": time.time()}
+        )
+        entry["chunks"][chunk_index] = chunk_data
+
+        if len(entry["chunks"]) == entry["total"]:
+            data = b"".join(entry["chunks"][i] for i in range(entry["total"]))
+            del pending_batches[key]
+            process_batch(cam_id, data, batch_start_time)
+
+        now = time.time()
+        stale_keys = [
+            k for k, v in pending_batches.items()
+            if now - v["first_seen"] > STALE_BATCH_TIMEOUT_SEC
+        ]
+        for k in stale_keys:
+            del pending_batches[k]
 
 
 def next_frame(cam_id):
@@ -430,5 +480,7 @@ if __name__ == "__main__":
     ip = lan_ip() or "<this machine's LAN IP>"
     print("Starting camera server...")
     print(f"Dashboard: http://{ip}:5001/")
+    print(f"UDP camera ingest listening on port {UDP_INGEST_PORT} (edge_client.py uses this automatically - it only needs SERVER_URL's host)")
     print(f"Point edge_client.py at this server with: SERVER_URL=http://{ip}:5001")
+    threading.Thread(target=udp_ingest_loop, daemon=True).start()
     app.run(host="0.0.0.0", port=5001, debug=False, threaded=True)

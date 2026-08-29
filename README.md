@@ -2,8 +2,8 @@
 
 Streams camera feeds from a Jetson Xavier (edge device) to a live dashboard on your laptop (base station), over the same LAN.
 
-- **`client/edge_client.py`** runs on the **Xavier**: captures each camera, hardware-encodes it (H.264), and pushes batches to the laptop over a WebSocket.
-- **`server/server.py`** runs on the **laptop**: receives those batches, decodes them, and serves a dashboard (`http://<laptop-ip>:5001/`) showing every camera's live feed plus its FPS/latency.
+- **`client/edge_client.py`** runs on the **Xavier**: captures each camera, hardware-encodes it (H.264), and pushes batches to the laptop over **UDP** (port 5002) — chosen for lower latency than a reliable transport, at the cost of no delivery guarantee (a batch that loses a packet is just dropped).
+- **`server/server.py`** runs on the **laptop**: receives those batches, decodes them, and serves a dashboard (`http://<laptop-ip>:5001/`) showing every camera's live feed plus its FPS/latency, delivered to the browser over a WebSocket (browsers can't speak raw UDP).
 
 The two machines have different IPs on the same LAN, so the client has to be told where the server is — there's no baked-in default. That's the `SERVER_URL` step below.
 
@@ -25,7 +25,8 @@ Point edge_client.py at this server with: SERVER_URL=http://<this-machine's-actu
 
 - Open the **Dashboard** URL in a browser — tiles appear automatically as cameras start sending.
 - Copy the exact **`SERVER_URL=...`** value from *this run's* terminal output — you'll paste it into the command you run on the Xavier in step 3.
-- If the laptop reconnects to WiFi or its IP otherwise changes, restart `server.py` and re-copy the new `SERVER_URL` — an old one will just time out (this is the single most common reason cameras don't show up on the dashboard: the client silently pushing frames at a stale/example IP nothing is listening on).
+- If the laptop reconnects to WiFi or its IP otherwise changes, restart `server.py` and re-copy the new `SERVER_URL` — an old one will just silently receive nothing (this is the single most common reason cameras don't show up on the dashboard: the client pushing frames at a stale/example IP nothing is listening on).
+- The laptop's firewall must allow inbound **UDP on port 5002** (camera ingest) in addition to TCP 5001 (dashboard) — camera batches use UDP even though the dashboard itself is plain HTTP/WebSocket.
 
 ## 2. On the Xavier: find your camera IDs
 
@@ -60,7 +61,7 @@ If `SERVER_URL` isn't set, `edge_client.py` fails immediately with instructions 
 
 ## Troubleshooting
 
-- **A camera never shows up on the dashboard**: check the Xavier's terminal for `[cam N] ws send failed: timed out`. This means `SERVER_URL` points at a host nothing is listening on — almost always because it's stale (laptop reconnected WiFi and got a new IP) or was copy-pasted from a doc/example instead of the actual line `server.py` printed on its most recent run. Compare the IP in the Xavier's `Starting edge client, pushing [...] to http://...` line against the laptop's own `Dashboard: http://...` line — if they don't match, that's the bug; restart `server.py`, copy its freshly-printed `SERVER_URL=...`, and rerun the client with that exact value. (Less commonly: the laptop's firewall is blocking port 5001.)
+- **A camera never shows up on the dashboard**: UDP has no delivery confirmation, so a wrong destination fails *silently* on the Xavier — no error printed at all (unlike the old WebSocket transport, which at least logged a "send failed"). First compare the IP in the Xavier's `Starting edge client, pushing [...] to http://...` line against the laptop's own `Dashboard: http://...` line — if they don't match, that's the bug; restart `server.py`, copy its freshly-printed `SERVER_URL=...`, and rerun the client with that exact value. If they do match, check the laptop's firewall is allowing inbound UDP on port 5002 (not just TCP 5001).
 - **`edge_client.py` exits with a GStreamer error**: you forgot the `PYTHONPATH` prefix, or ran with a plain `pip install opencv-python` present — see the note in `client/requirements.txt`.
 - **Wrong/no camera picture, or capture fails outright**: `/dev/videoN` indices can get renumbered by udev after a reboot or USB replug. Re-run the camera ID script in step 2 and update `CAMERA_IDS` if the indices moved.
 - **Single-machine testing, no second device handy**: `multi_camera.py` at the repo root is a standalone, single-process fallback (no client/server split, no network hop) — useful for confirming a camera works at all before wiring up the split setup.

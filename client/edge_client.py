@@ -1,11 +1,12 @@
-import json
 import os
+import socket
+import struct
 import tempfile
 import threading
 import time
+from urllib.parse import urlparse
 
 import cv2
-import websocket
 
 # --- Configuration ---
 # cam_id 0 (ZED 2i) is excluded: at its native 4416x1242 resolution the
@@ -31,6 +32,16 @@ FRAME_HEIGHT = 480
 # at native resolution instead.
 NATIVE_RESOLUTION_CAMERA_IDS = {0}
 BATCH_DURATION_SEC = 0.5
+
+# Must match server/server.py's UDP_INGEST_PORT / INGEST_HEADER_FORMAT /
+# UDP_MAX_PACKET exactly - there's no shared module between the two
+# standalone scripts, so these are duplicated by convention rather than
+# imported.
+UDP_INGEST_PORT = 5002
+UDP_MAX_PACKET = 1400
+INGEST_HEADER_FORMAT = "!IdHH"  # cam_id, batch_start_time, chunk_index, total_chunks
+INGEST_HEADER_SIZE = struct.calcsize(INGEST_HEADER_FORMAT)
+UDP_CHUNK_PAYLOAD_SIZE = UDP_MAX_PACKET - INGEST_HEADER_SIZE
 
 
 def build_gst_pipeline(path, width, height, fps):
@@ -76,8 +87,9 @@ def capture_loop(cam_id):
         camera.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
         camera.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
 
-    ws_url = SERVER_URL.replace("http://", "ws://", 1) + f"/ingest/{cam_id}"
-    ws = None
+    server_host = urlparse(SERVER_URL).hostname
+    udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    udp_sock.connect((server_host, UDP_INGEST_PORT))
 
     while True:
         batch = []
@@ -88,8 +100,7 @@ def capture_loop(cam_id):
             success, frame = camera.read()
             if not success:
                 print(f"[cam {cam_id}] read failed, stopping capture thread")
-                if ws is not None:
-                    ws.close()
+                udp_sock.close()
                 return
 
             now = time.time()
@@ -110,18 +121,16 @@ def capture_loop(cam_id):
             print(f"[cam {cam_id}] encode failed: {e}")
             continue
 
+        total_chunks = max(1, -(-len(payload) // UDP_CHUNK_PAYLOAD_SIZE))  # ceil div
         try:
-            if ws is None:
-                ws = websocket.create_connection(ws_url, timeout=5)
-            ws.send(json.dumps({"batch_start_time": batch_start_time}))
-            ws.send(payload, opcode=websocket.ABNF.OPCODE_BINARY)
-        except (websocket.WebSocketException, OSError) as e:
-            print(f"[cam {cam_id}] ws send failed: {e}")
-            try:
-                ws.close()
-            except Exception:
-                pass
-            ws = None
+            for i in range(total_chunks):
+                chunk = payload[i * UDP_CHUNK_PAYLOAD_SIZE : (i + 1) * UDP_CHUNK_PAYLOAD_SIZE]
+                header = struct.pack(
+                    INGEST_HEADER_FORMAT, cam_id, batch_start_time, i, total_chunks
+                )
+                udp_sock.send(header + chunk)
+        except OSError as e:
+            print(f"[cam {cam_id}] udp send failed: {e}")
 
 
 def check_server_url():
