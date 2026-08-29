@@ -129,9 +129,12 @@ def check_server_url():
         raise RuntimeError(
             "SERVER_URL is not set. Set it to the base station's address, "
             "e.g.:\n\n"
-            "    SERVER_URL=http://192.168.1.23:5001 python3 edge_client.py\n\n"
-            "(find the right IP from server.py's startup log, which prints "
-            "the address(es) it's reachable at)."
+            "    SERVER_URL=http://<server-lan-ip>:5001 python3 edge_client.py\n\n"
+            "Replace <server-lan-ip> with the address from server.py's own "
+            "startup log on the base station (it prints the exact "
+            "SERVER_URL=... to use) - don't reuse an IP from an old run or "
+            "from this message, since it changes whenever the base station's "
+            "network changes."
         )
 
 
